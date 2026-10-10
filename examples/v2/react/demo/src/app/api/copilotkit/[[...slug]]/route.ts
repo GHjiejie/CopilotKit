@@ -12,6 +12,7 @@ import OpenAI from "openai";
 
 const openRouterApiKey = process.env.OPENROUTER_API_KEY?.trim();
 const openAIApiKey = process.env.OPENAI_API_KEY?.trim();
+const openAIBaseURL = process.env.OPENAI_BASE_URL?.trim() || undefined;
 const OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1";
 const DEFAULT_OPENROUTER_MODEL = "openai/gpt-5-mini";
 
@@ -29,7 +30,12 @@ const determineModel = (): BuiltInAgentClassicConfig["model"] => {
     return openrouter(determineOpenRouterModelId());
   }
   if (openAIApiKey) {
-    return "openai/gpt-5.2";
+    const openai = createOpenAI({
+      apiKey: openAIApiKey,
+      baseURL: openAIBaseURL,
+    });
+
+    return openai.responses(process.env.OPENAI_MODEL?.trim() || "gpt-5.2");
   }
   if (process.env.ANTHROPIC_API_KEY?.trim()) {
     // Claude Opus 4.8 supports adaptive thinking
@@ -47,7 +53,14 @@ const builtInAgent = new BuiltInAgent({
     "You are a helpful AI assistant. Use reasoning to answer the user's question. If you don't know the answer, say you don't know.",
   providerOptions: {
     ...(openAIApiKey
-      ? { openai: { reasoningEffort: "high", reasoningSummary: "detailed" } }
+      ? {
+          openai: {
+            reasoningEffort:
+              process.env.OPENAI_REASONING_EFFORT?.trim() || "high",
+            reasoningSummary: "detailed",
+            store: false,
+          },
+        }
       : {}),
     ...(!openAIApiKey &&
       !openRouterApiKey &&
@@ -60,7 +73,7 @@ const builtInAgent = new BuiltInAgent({
 // Set up transcription service if OpenAI API key is available
 const transcriptionService = openAIApiKey
   ? new TranscriptionServiceOpenAI({
-      openai: new OpenAI({ apiKey: openAIApiKey }),
+      openai: new OpenAI({ apiKey: openAIApiKey, baseURL: openAIBaseURL }),
     })
   : undefined;
 
