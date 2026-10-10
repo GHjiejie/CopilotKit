@@ -1,0 +1,414 @@
+---
+title: "现有 LangGraph 项目接入指南（中文）"
+description: "将现有 Python LangGraph Agent 接入 CopilotKit，完成聊天、页面上下文和前端工具集成。"
+icon: "lucide/Plug"
+---
+
+本文面向已有 **Python LangGraph Agent** 的项目，以 **React / Next.js** 为前端示例。接入时保留现有模型、RAG、业务工具和图编排，在服务边界增加协议适配，再由 CopilotKit 提供用户交互能力。
+
+本文以 2026-10-10 检查的仓库版本为基准：JavaScript SDK `1.73.3`、Python SDK `0.1.96`。示例固定相关依赖以便复现；`/v2` 是 API 导入子路径，npm 包版本本身仍为 `1.x`。
+
+## 1. 选择接入路径
+
+| 现有部署方式 | 接入方式 | Runtime 注册的 Agent |
+| --- | --- | --- |
+| 在 Python 服务中直接运行 graph | 通过 FastAPI 暴露 AG-UI 接口 | `HttpAgent` |
+| 使用 `langgraph dev`、LangGraph Server 或 LangSmith Deployment | 连接现有 LangGraph Server | LangGraph Server 适配器（见第 6 节） |
+| 只有普通 JSON 或自定义 SSE 聊天接口 | 包装内部 graph，或将现有接口转换为 AG-UI | 根据适配后的协议选择 |
+
+AG-UI 是 Agent 与用户界面之间的事件协议。普通 SSE、LangGraph Server API 和 AG-UI 的事件格式不同，连接时必须使用相应适配器。
+
+本文先完成 FastAPI 路径；已有 LangGraph Server 的项目可跳过第 3 节，按第 6 节替换 Runtime 中的 Agent 配置。
+
+```text
+React 页面
+  └─ CopilotKitProvider / CopilotChat
+       └─ Next.js /api/copilotkit（CopilotKit Runtime）
+            └─ Python /ag-ui（FastAPI + AG-UI 适配器）
+                 └─ 现有 LangGraph graph
+```
+
+相关代码位于 `packages/react-core`（React UI 与 hooks）、`packages/runtime`（服务端路由）、`sdk-python`（Python 扩展）和 `examples/integrations/langgraph-fastapi`（完整示例）。在自己的应用中安装已发布的 SDK 即可开始接入。
+
+## 2. 安装依赖
+
+在 **Agent 项目目录**安装：
+
+```bash
+uv add \
+  "copilotkit==0.1.96" \
+  "ag-ui-langgraph[fastapi]==0.0.44" \
+  "ag-ui-protocol==0.1.22" \
+  fastapi uvicorn python-dotenv
+```
+
+Python SDK 支持 Python 3.10–3.14，仓库 FastAPI 示例使用 Python 3.12 及以上。上述适配器组合要求较新的 LangChain / LangGraph；已有项目应在隔离环境中检查依赖解析及回归，保留锁文件。仓库示例固定了 `langchain==1.2.15`、`langgraph==1.1.6`。
+
+`ag-ui-langgraph==0.0.43` 与已发布的 `copilotkit==0.1.96` 存在每次请求克隆 Agent 时的参数兼容问题。本文采用仓库示例已配对的 `0.0.44`，并同时固定其依赖的协议版本。
+
+在 **前端应用目录**安装：
+
+```bash
+npm install \
+  @copilotkit/react-core@1.73.3 \
+  @copilotkit/runtime@1.73.3 \
+  @ag-ui/client@0.0.59 \
+  zod@3
+```
+
+Node.js 使用 20 或以上，React 使用 18 或 19。这里将直接安装的 `@ag-ui/client` 与该版本 Runtime 的依赖对齐。Provider、聊天组件、hooks 和样式均从 `@copilotkit/react-core/v2` 导入。
+
+## 3. 暴露 LangGraph 的 AG-UI 接口
+
+在 Agent 项目里新增 `agent_server.py`：
+
+```python
+from fastapi import FastAPI
+from ag_ui_langgraph import add_langgraph_fastapi_endpoint
+from copilotkit import LangGraphAGUIAgent
+
+# 替换为自己项目里已编译 graph 的实际导入路径
+from my_agent.graph import graph
+
+app = FastAPI()
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
+
+add_langgraph_fastapi_endpoint(
+    app=app,
+    agent=LangGraphAGUIAgent(
+        name="my_agent",
+        description="我的业务助手",
+        graph=graph,
+    ),
+    path="/ag-ui",
+)
+```
+
+已有 FastAPI 应用可以直接把 endpoint 添加到现有 `app`。
+
+### 配置 checkpointer
+
+在原来创建 graph 的位置检查 checkpointer。自行通过 FastAPI 运行时，适配器需要读取线程状态；未配置 checkpointer 会出现 `No checkpointer set`。
+
+若当前尚未配置，可在本地开发时使用：
+
+```python
+from langgraph.checkpoint.memory import MemorySaver
+
+# builder 是项目原有的 StateGraph
+graph = builder.compile(checkpointer=MemorySaver())
+```
+
+已有持久化 checkpointer 时继续使用原有配置。`MemorySaver()` 只保存进程内状态；生产环境需要根据会话恢复要求选择 PostgreSQL 等持久化实现。
+
+### 启动 Agent
+
+将 Agent 原有的模型密钥及业务配置放入服务端 `.env`，并将凭证文件加入 `.gitignore`：
+
+```bash
+uv run uvicorn agent_server:app \
+  --host 0.0.0.0 \
+  --port 8123 \
+  --env-file .env
+```
+
+启动后，健康检查为 `http://localhost:8123/health`，AG-UI 地址为 `http://localhost:8123/ag-ui`。
+
+## 4. 配置 CopilotKit Runtime
+
+Next.js 可以直接托管 Runtime。在前端应用的 `.env.local` 中配置 Agent 地址：
+
+```dotenv
+AGENT_URL=http://localhost:8123/ag-ui
+```
+
+创建 `app/api/copilotkit/[[...slug]]/route.ts`：
+
+```ts
+import {
+  CopilotRuntime,
+  InMemoryAgentRunner,
+  createCopilotRuntimeHandler,
+} from "@copilotkit/runtime/v2";
+import { HttpAgent } from "@ag-ui/client";
+
+export const runtime = "nodejs";
+
+const agentUrl = process.env.AGENT_URL;
+
+if (!agentUrl) {
+  throw new Error("缺少 AGENT_URL 环境变量");
+}
+
+const copilotRuntime = new CopilotRuntime({
+  agents: {
+    my_agent: new HttpAgent({ url: agentUrl }),
+  },
+  runner: new InMemoryAgentRunner(),
+});
+
+const handler = createCopilotRuntimeHandler({
+  runtime: copilotRuntime,
+  basePath: "/api/copilotkit",
+});
+
+export const GET = handler;
+export const POST = handler;
+export const PATCH = handler;
+export const DELETE = handler;
+```
+
+该 handler 默认使用多路由模式，前端按第 5 节设置 `useSingleEndpoint={false}`。
+
+| 配置 | 示例 | 作用 |
+| --- | --- | --- |
+| 前端 `runtimeUrl` | `/api/copilotkit` | 浏览器访问 Runtime |
+| `HttpAgent.url` | `http://localhost:8123/ag-ui` | Runtime 服务端访问 Agent |
+| 前端 `agentId` | `my_agent` | 选择 Runtime 的 `agents` 对象中同名的 key |
+
+`AGENT_URL` 是服务端地址。Docker 部署时应使用 Agent 服务的内部域名，例如 `http://agent:8123/ag-ui`；容器中的 `localhost` 只指向当前容器。
+
+Vite / React SPA 可以单独部署 Node、Express 或 Hono Runtime，前端使用完整的 `runtimeUrl` 并配置允许的 CORS 来源。参见 [React SPA](/react-spa) 和 [Runtime 部署适配器](/runtime-server-adapter)。
+
+## 5. 嵌入聊天界面
+
+以 Next.js 的 `app/page.tsx` 为例：
+
+```tsx
+"use client";
+
+import {
+  CopilotKitProvider,
+  CopilotChat,
+} from "@copilotkit/react-core/v2";
+import "@copilotkit/react-core/v2/styles.css";
+
+export default function Page() {
+  return (
+    <CopilotKitProvider
+      runtimeUrl="/api/copilotkit"
+      agentId="my_agent"
+      useSingleEndpoint={false}
+    >
+      <div
+        style={{
+          display: "grid",
+          gridTemplateColumns: "1fr 420px",
+          height: "100vh",
+        }}
+      >
+        <main style={{ padding: 24 }}>
+          <h1>我的业务系统</h1>
+          {/* 在这里放项目原有的业务页面 */}
+        </main>
+        <aside style={{ minHeight: 0 }}>
+          <CopilotChat
+            labels={{ chatInputPlaceholder: "请输入你的问题……" }}
+          />
+        </aside>
+      </div>
+    </CopilotKitProvider>
+  );
+}
+```
+
+运行前端应用后即可验证基础聊天。所有 CopilotKit hooks 都要在 Provider 的子组件中调用；Next.js 中使用 hooks 的组件声明为 `"use client"`。
+
+新接入统一使用 `/v2` 的 Provider、UI 和 hooks。仓库仍保留旧版兼容入口；混用根路径 hooks 与 v2 UI 会增加排查难度。多路由与单路由的配置对应关系见 [Runtime HTTP endpoints](/backend/runtime-endpoints)。
+
+## 6. 已有 LangGraph Server 的替换配置
+
+如果 Agent 已经运行在 LangGraph Server，使用 [LangGraph quickstart](/langgraph-python/quickstart) 的 Server / LangSmith 分支注册框架适配器，替换第 4 节的 `HttpAgent`。该分支的适配器配置为：
+
+| 参数 | 本文示例 | 作用 |
+| --- | --- | --- |
+| `deploymentUrl` | `process.env.LANGGRAPH_DEPLOYMENT_URL` | LangGraph Server 的地址 |
+| `graphId` | `business_graph` | Server 中要运行的图 |
+| `langsmithApiKey` | `process.env.LANGSMITH_API_KEY` | 服务所需的凭证 |
+
+保留第 4 节的多路由 handler 和第 5 节的前端配置，Runtime 的 Agent key 继续使用 `my_agent`。移除原 `AGENT_URL` 检查，并配置：
+
+```dotenv
+LANGGRAPH_DEPLOYMENT_URL=http://localhost:8123
+LANGSMITH_API_KEY=你的服务所需密钥
+```
+
+其中 `graphId` 对应 `langgraph.json` 中的图名称：
+
+```json
+{
+  "dependencies": ["."],
+  "graphs": {
+    "business_graph": "./my_agent/graph.py:graph"
+  },
+  "env": ".env"
+}
+```
+
+前端仍使用 `agentId="my_agent"`；它与 Server 的 `business_graph` 可以不同。
+
+本地开发需要 LangGraph CLI，可在 Agent 项目中安装并显式指定端口：
+
+```bash
+uv add --dev "langgraph-cli[inmem]"
+uv run langgraph dev --port 8123
+```
+
+裸 `langgraph dev` 默认监听 `2024`；Runtime 中的地址应与实际端口一致。LangGraph Server 管理持久化，供 Server 加载的 graph 按其要求编译，不添加 FastAPI 路径里的自定义 checkpointer。
+
+Server 适配器连接 LangGraph 的 runs / threads API，不能用指向同一 Server URL 的普通 `HttpAgent` 代替。框架适配器的具体入口沿用 quickstart，Runtime 和前端继续使用 `/v2`。
+
+## 7. 逐步接入应用交互
+
+先验证连续对话，再根据业务需要加入页面上下文、前端工具和共享状态。
+
+### 页面上下文
+
+在 Provider 内部的业务组件中注册当前页面数据：
+
+```tsx
+import { useAgentContext } from "@copilotkit/react-core/v2";
+
+function OrderPage() {
+  useAgentContext({
+    description: "当前页面的订单信息",
+    value: { orderId: "order-1001", status: "pending" },
+  });
+
+  return <div>订单详情</div>;
+}
+```
+
+自定义 graph 的 State 需保留 CopilotKit 字段。例如，在现有业务 State 定义中继承 `CopilotKitState` 并保留原有字段及 reducers：
+
+```python
+from copilotkit import CopilotKitState
+
+class AgentState(CopilotKitState):
+    selected_order_id: str
+```
+
+节点通过 `state.get("copilotkit", {}).get("context", [])` 读取上下文，再将其用于提示词或业务逻辑。`useAgentContext` 会把对象序列化为 JSON 字符串；Python 按字段读取某个条目的 `value` 时使用 `json.loads()`。
+
+### 前端工具
+
+在 Provider 内部注册受控的页面操作：
+
+```tsx
+import { useState } from "react";
+import { z } from "zod";
+import { useFrontendTool } from "@copilotkit/react-core/v2";
+
+const tabSchema = z.object({
+  tab: z.enum(["overview", "orders"]),
+});
+
+function Workspace() {
+  const [tab, setTab] = useState("overview");
+
+  useFrontendTool(
+    {
+      name: "switchTab",
+      description: "切换当前页面标签",
+      agentId: "my_agent",
+      parameters: tabSchema,
+      handler: async (args) => {
+        const { tab } = tabSchema.parse(args);
+        setTab(tab);
+        return { ok: true, tab };
+      },
+    },
+    [],
+  );
+
+  return <div>当前标签：{tab}</div>;
+}
+```
+
+Agent 侧还需要接收这些工具。自定义 `StateGraph` 从 `state["copilotkit"]["actions"]` 读取并绑定工具，同时区分前端执行的工具与后端 `ToolNode` 工具。
+
+使用 `langchain.agents.create_agent` 时，可合并 `CopilotKitMiddleware()` 与保留业务字段的 State schema：
+
+```python
+from langchain.agents import create_agent
+from copilotkit import CopilotKitMiddleware, CopilotKitState
+from langgraph.checkpoint.memory import MemorySaver
+
+# your_existing_model / your_backend_tools 替换为项目已有配置
+graph = create_agent(
+    model=your_existing_model,
+    tools=your_backend_tools,
+    middleware=[CopilotKitMiddleware()],
+    state_schema=CopilotKitState,
+    checkpointer=MemorySaver(),  # 自建 FastAPI 场景
+)
+```
+
+已有 middleware、业务 State 和持久化配置时将它们合并进去。上述参数适用于 `create_agent`，旧的 `create_react_agent` 不能直接照搬。参见 [Frontend tools](/frontend-tools)。
+
+### 共享状态与自定义 UI
+
+使用 `useAgent({ agentId: "my_agent" })` 读取 `agent.state`，通过 `agent.setState()` 更新本地状态；后续运行会携带更新后的状态。LangGraph 也要定义对应字段并返回状态更新。`setState()` 本身不会启动一次 Agent 运行，也不代表数据已持久化。
+
+已有自定义聊天 UI 可以继续使用。程序化触发时，在 `agent.addMessage(...)` 后调用 `useCopilotKit()` 返回的 `copilotkit.runAgent({ agent })`，使注册的上下文、前端工具和工具结果继续处理经过 CopilotKit Core。参见 [Programmatic control](/programmatic-control) 和 [Shared state](/shared-state)。
+
+## 8. 联调验收与上线配置
+
+FastAPI 路径先检查本文添加的 Agent 健康接口：
+
+```bash
+curl http://localhost:8123/health
+```
+
+该接口应返回 `{"status":"ok"}`。LangGraph Server 路径使用现有服务的健康检查方式。
+
+两种路径都检查 Runtime 的 Agent 发现：
+
+```bash
+curl http://localhost:3000/api/copilotkit/info
+```
+
+Runtime 信息应包含 `my_agent`。`/info` 成功仅证明 Runtime 可访问且已注册 Agent，还需要在页面发送消息验证完整链路。
+
+建议依次验证：
+
+1. 发送一条消息，确认响应和事件流正常。
+2. 发送依赖上一轮内容的追问，确认线程连续性。
+3. 注册页面上下文，让 Agent 总结当前页面数据。
+4. 注册前端工具，让 Agent 切换标签或执行对应操作。
+5. 验证会话切换、重启恢复与用户之间的线程权限。
+
+| 现象 | 优先检查 |
+| --- | --- |
+| Agent discovery 失败 | `/info` 路由、前端 `agentId` 与 Runtime 注册 key |
+| `/info` 正常，发送消息失败 | Agent 地址、协议类型、端口及模型配置 |
+| Runtime 404 | `[[...slug]]/route.ts`、HTTP 方法导出及传输模式配对 |
+| `No checkpointer set` | 自建 FastAPI graph 的 checkpointer |
+| Agent 不调用页面工具 | 工具是否绑定给模型，前端工具结果是否正确回传 |
+| Agent 读不到页面数据 | State 中的 `copilotkit` 字段和节点的上下文使用逻辑 |
+| 重启后历史丢失 | LangGraph checkpointer 与 Runtime runner 的存储配置 |
+| Docker 中连接失败 | 服务间地址是否仍使用当前容器的 `localhost` |
+
+上线时落实以下配置：
+
+- **认证与授权**：将项目现有 session / JWT 校验接到 Runtime 路由或 `hooks.onRequest`，检查用户对 Agent、线程和业务数据的访问权限。默认内存模式没有应用级用户隔离，随机 `threadId` 不能代替授权。
+- **持久化**：LangGraph checkpointer 保存图状态；Runtime runner 保存其负责的线程和事件历史。分别确定恢复要求。`InMemoryAgentRunner` 非持久，重启及历史逐出都会影响恢复。
+- **凭证与流式代理**：密钥保留在服务端；反向代理允许长请求并关闭 SSE buffering。跨域前端配置允许的来源与所需请求头。
+
+基础聊天可以先使用内存 runner。需要 CopilotKit Intelligence 的托管线程等能力时，再按 [Intelligence quickstart](/intelligence/quickstart) 配置；它是独立扩展步骤。
+
+## 参考资料与验证范围
+
+- [仓库 LangGraph FastAPI 示例](https://github.com/CopilotKit/CopilotKit/tree/main/examples/integrations/langgraph-fastapi)
+- [CopilotKit LangGraph FastAPI quickstart](https://docs.copilotkit.ai/langgraph-fastapi/quickstart)
+- [AG-UI 协议介绍](https://docs.ag-ui.com/introduction)
+- [LangGraph 持久化](https://docs.langchain.com/oss/python/langgraph/persistence)
+- [LangGraph Server 本地开发](https://docs.langchain.com/langsmith/local-dev-testing)
+- [认证配置](/auth) 与 [AgentRunner](/backend/agent-runner)
+
+本文依据仓库源码、示例与对应版本的包元信息整理。`my_agent.graph`、模型、业务工具、State、认证及部署地址需要替换为接入项目的实际配置；文档不代表已在该业务 Agent 上完成端到端联调。
