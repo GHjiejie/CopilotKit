@@ -10,9 +10,15 @@ import {
   useFrontendTool,
 } from "@copilotkit/react-core/v2";
 import type { ToolsMenuItem, SandboxFunction } from "@copilotkit/react-core/v2";
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { z } from "zod";
 import { DEMO_RUNTIME_URL } from "./runtime-url";
+import {
+  loadDemoThreads,
+  resolveDemoThread,
+  SELECTED_THREAD_KEY,
+} from "./demo-threads";
+import type { DemoThread } from "./demo-threads";
 
 // Disable static optimization for this page
 export const dynamic = "force-dynamic";
@@ -123,15 +129,50 @@ function Chat({
   onToggleTheme: () => void;
 }) {
   const colors = themeColors[theme];
-  const [selectedThreadId, setSelectedThreadId] = useState<
-    "thread---a" | "thread---b" | "thread---c" | undefined
-  >(undefined);
-  const threadOptions: Array<{ id: typeof selectedThreadId; label: string }> = [
-    { id: undefined, label: "Stateless" },
-    { id: "thread---a", label: "Thread A" },
-    { id: "thread---b", label: "Thread B" },
-    { id: "thread---c", label: "Thread C" },
-  ];
+  const [selectedThreadId, setSelectedThreadId] = useState<string | null>(null);
+  const [threads, setThreads] = useState<DemoThread[]>([]);
+  const [historyError, setHistoryError] = useState(false);
+
+  const selectThread = useCallback((id: string) => {
+    setSelectedThreadId(id);
+    try {
+      localStorage.setItem(SELECTED_THREAD_KEY, id);
+    } catch {
+      // Chat still works when browser storage is unavailable.
+    }
+  }, []);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    let savedThreadId: string | null = null;
+    try {
+      savedThreadId = localStorage.getItem(SELECTED_THREAD_KEY);
+    } catch {
+      // Fall back to the most recent thread on this local runtime.
+    }
+    loadDemoThreads(DEMO_RUNTIME_URL, controller.signal)
+      .then((history) => {
+        if (controller.signal.aborted) return;
+        setThreads(history);
+        selectThread(
+          resolveDemoThread(savedThreadId, history, () => crypto.randomUUID()),
+        );
+      })
+      .catch(() => {
+        if (controller.signal.aborted) return;
+        setHistoryError(true);
+        selectThread(
+          resolveDemoThread(savedThreadId, [], () => crypto.randomUUID()),
+        );
+      });
+    return () => controller.abort();
+  }, [selectThread]);
+
+  const threadOptions =
+    selectedThreadId &&
+    !threads.some((thread) => thread.id === selectedThreadId)
+      ? [{ id: selectedThreadId, label: "新会话" }, ...threads]
+      : threads;
 
   useConfigureSuggestions({
     instructions: "Suggest follow-up tasks based on the current page content",
@@ -140,7 +181,7 @@ function Chat({
 
   useAgentContext({
     description: "The current Thread ID is:",
-    value: selectedThreadId ?? "stateless",
+    value: selectedThreadId ?? "loading",
   });
 
   //useConfigureSuggestions({
@@ -219,7 +260,14 @@ function Chat({
         gap: "16px",
       }}
     >
-      <div style={{ display: "flex", gap: "10px", alignItems: "center" }}>
+      <div
+        style={{
+          display: "flex",
+          gap: "10px",
+          alignItems: "center",
+          paddingRight: 64,
+        }}
+      >
         <button
           type="button"
           onClick={onToggleTheme}
@@ -279,78 +327,109 @@ function Chat({
             flex: 1,
             display: "flex",
             gap: "10px",
-            justifyContent: "center",
+            alignItems: "center",
+            minWidth: 0,
           }}
         >
-          {threadOptions.map(({ id, label }) => {
-            const isActive = id === selectedThreadId;
-            return (
-              <button
-                key={id ?? "stateless"}
-                type="button"
-                onClick={() => setSelectedThreadId(id)}
-                aria-pressed={isActive}
-                style={{
-                  padding: "6px 14px",
-                  borderRadius: "20px",
-                  border: isActive
-                    ? `2px solid ${colors.text}`
-                    : `1px solid ${colors.border}`,
-                  backgroundColor: isActive ? colors.text : colors.bg,
-                  color: isActive ? colors.bg : colors.text,
-                  fontWeight: 600,
-                  fontSize: "0.85rem",
-                  cursor: "pointer",
-                  transition: "all 0.15s ease-in-out",
-                }}
-              >
+          <select
+            aria-label="历史会话"
+            value={selectedThreadId ?? ""}
+            disabled={!selectedThreadId}
+            onChange={(event) => selectThread(event.target.value)}
+            style={{
+              flex: 1,
+              minWidth: 0,
+              maxWidth: 640,
+              padding: "8px 12px",
+              borderRadius: 8,
+              border: `1px solid ${colors.border}`,
+              backgroundColor: colors.bg,
+              color: colors.text,
+            }}
+          >
+            {!selectedThreadId && <option value="">正在恢复会话…</option>}
+            {threadOptions.map(({ id, label }) => (
+              <option key={id} value={id}>
                 {label}
-              </button>
-            );
-          })}
+              </option>
+            ))}
+          </select>
+          <button
+            type="button"
+            disabled={!selectedThreadId}
+            onClick={() => {
+              const id = crypto.randomUUID();
+              setThreads((current) => [
+                {
+                  id,
+                  label: `新会话 · ${new Date().toLocaleTimeString("zh-CN")}`,
+                },
+                ...current,
+              ]);
+              selectThread(id);
+            }}
+            style={{
+              padding: "8px 14px",
+              borderRadius: 8,
+              border: `1px solid ${colors.border}`,
+              backgroundColor: colors.bg,
+              color: colors.text,
+              cursor: "pointer",
+              whiteSpace: "nowrap",
+            }}
+          >
+            新会话
+          </button>
         </div>
       </div>
+      <div style={{ fontSize: 12, opacity: 0.65 }}>
+        {historyError
+          ? "历史会话暂时无法加载，请刷新重试。"
+          : "切换会话或刷新后可恢复聊天和生成的 UI。历史记录保留到本地服务停止。"}
+      </div>
       <div style={{ flex: 1, minHeight: 0 }}>
-        <CopilotChat
-          className={theme === "dark" ? "dark" : undefined}
-          input={{ toolsMenu }}
-          welcomeScreen={{
-            children: ({ input, suggestionView }) => (
-              <div
-                style={{
-                  flex: 1,
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "center",
-                  padding: "0 16px",
-                }}
-              >
-                <div style={{ width: "100%", maxWidth: 768 }}>
-                  <CopilotChatAssistantMessage
-                    message={{
-                      id: "local-inspector-preview",
-                      role: "assistant",
-                      content:
-                        "This local preview lets you open the CopilotKit Inspector directly from an assistant response. Hover over the wrench icon below, then click it to inspect the current run.",
-                    }}
-                  />
-                  <div style={{ marginTop: 32 }}>{input}</div>
-                  <div
-                    style={{
-                      display: "flex",
-                      justifyContent: "center",
-                      marginTop: 16,
-                    }}
-                  >
-                    {suggestionView}
+        {selectedThreadId && (
+          <CopilotChat
+            className={theme === "dark" ? "dark" : undefined}
+            input={{ toolsMenu }}
+            welcomeScreen={{
+              children: ({ input, suggestionView }) => (
+                <div
+                  style={{
+                    flex: 1,
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    padding: "0 16px",
+                  }}
+                >
+                  <div style={{ width: "100%", maxWidth: 768 }}>
+                    <CopilotChatAssistantMessage
+                      message={{
+                        id: "local-inspector-preview",
+                        role: "assistant",
+                        content:
+                          "This local preview lets you open the CopilotKit Inspector directly from an assistant response. Hover over the wrench icon below, then click it to inspect the current run.",
+                      }}
+                    />
+                    <div style={{ marginTop: 32 }}>{input}</div>
+                    <div
+                      style={{
+                        display: "flex",
+                        justifyContent: "center",
+                        marginTop: 16,
+                      }}
+                    >
+                      {suggestionView}
+                    </div>
                   </div>
                 </div>
-              </div>
-            ),
-          }}
-          threadId={selectedThreadId}
-          key={selectedThreadId ?? "stateless"}
-        />
+              ),
+            }}
+            threadId={selectedThreadId}
+            key={selectedThreadId}
+          />
+        )}
       </div>
     </div>
   );
