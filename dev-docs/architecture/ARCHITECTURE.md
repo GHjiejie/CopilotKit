@@ -89,14 +89,15 @@ sequenceDiagram
 
 ## Guides
 
-| Guide                                      | What you'll learn                                       |
-| ------------------------------------------ | ------------------------------------------------------- |
-| [React Setup](setup-react.md)              | Provider, hooks, chat UI — full React integration       |
-| [Angular Setup](setup-angular.md)          | DI tokens, services, signals — full Angular integration |
-| [Vanilla JS Setup](setup-vanilla.md)       | CopilotKitCore API without any framework                |
-| [Runtime / Backend](setup-runtime.md)      | Express/Hono endpoints, agents, runners, middleware     |
-| [Multi-Agent Patterns](multi-agent.md)     | Multiple agents, routing, agent-specific tools          |
-| [Pluggable Architecture](plugin-points.md) | Every optional extension point with diagrams            |
+| Guide                                                       | What you'll learn                                              |
+| ----------------------------------------------------------- | -------------------------------------------------------------- |
+| [React Setup](setup-react.md)                               | Provider, hooks, chat UI — full React integration              |
+| [Angular Setup](setup-angular.md)                           | DI tokens, services, signals — full Angular integration        |
+| [Vanilla JS Setup](setup-vanilla.md)                        | CopilotKitCore API without any framework                       |
+| [Runtime / Backend](setup-runtime.md)                       | Express/Hono endpoints, agents, runners, middleware            |
+| [Multi-Agent Patterns](multi-agent.md)                      | Multiple agents, routing, agent-specific tools                 |
+| [Pluggable Architecture](plugin-points.md)                  | Every optional extension point with diagrams                   |
+| [Websandbox Source Analysis](websandbox-source-analysis.md) | iframe isolation, JavaScript execution, and host RPC (Chinese) |
 
 ---
 
